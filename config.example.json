@@ -1,0 +1,6 @@
+{
+  "api_key": "your Access ID / Client ID",
+  "api_secret": "your Access Secret / Client Secret",
+  "region": "eu",
+  "device_id": "your camera's device ID"
+}

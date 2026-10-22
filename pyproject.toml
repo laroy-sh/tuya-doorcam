@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tuya-doorcam"
+version = "0.1.0"
+description = "Status, live view and snapshots for Tuya battery door cameras, with a GNOME Shell extension"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+dependencies = ["tinytuya>=1.13", "cryptography"]
+
+[project.scripts]
+doorcam = "doorcam:main"
+
+[tool.setuptools]
+py-modules = ["doorcam"]

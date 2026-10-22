@@ -1,0 +1,13 @@
+# personal data: credentials, tokens, images, notes, experiments
+local/
+config.json
+tinytuya.json
+*token*.json
+*.jpg
+*.log
+
+.venv/
+__pycache__/
+*.egg-info/
+build/
+dist/
