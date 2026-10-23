@@ -4,6 +4,7 @@ import St from 'gi://St';
 
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
+import * as MessageTray from 'resource:///org/gnome/shell/ui/messageTray.js';
 import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 
@@ -14,6 +15,8 @@ const POLL_SECONDS = 600;       // background refresh; each refresh costs 2 Tuya
 const MIN_REFRESH_SECONDS = 60; // opening the menu refreshes at most this often
 const THUMB_WIDTH = 320;        // snapshots are 640x360
 const THUMB_HEIGHT = 180;
+const WATCH_RETRY_SECONDS = [30, 60, 300, 900]; // restart delays for `doorcam watch`
+const WATCH_LOGIN_NEEDED = 2;                   // its exit code when the push login expired
 
 function formatWhen(epoch) {
     if (!epoch)
@@ -59,6 +62,11 @@ export default class DoorCamExtension extends Extension {
         // today's events; clicking one opens its snapshot (downloaded on first use)
         this._todayItem = new PopupMenu.PopupSubMenuMenuItem('Today: …');
         menu.addMenuItem(this._todayItem);
+
+        // shown only when motion notifications (doorcam watch) are not working
+        this._alertsItem = new PopupMenu.PopupMenuItem('', {reactive: false});
+        this._alertsItem.hide();
+        menu.addMenuItem(this._alertsItem);
         menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
 
         this._liveItem = new PopupMenu.PopupImageMenuItem('Live view', 'media-playback-start-symbolic');
@@ -83,6 +91,13 @@ export default class DoorCamExtension extends Extension {
             this._refresh(true);
             return GLib.SOURCE_CONTINUE;
         });
+
+        // stays enabled on the lock screen (session-modes) so alerts keep coming; hide the button there
+        this._sessionId = Main.sessionMode.connect('updated', () => this._updateLocked());
+        this._updateLocked();
+
+        this._watchFailures = 0;
+        this._startWatch();
     }
 
     disable() {
@@ -90,12 +105,137 @@ export default class DoorCamExtension extends Extension {
             GLib.source_remove(this._pollId);
             this._pollId = null;
         }
+        if (this._sessionId) {
+            Main.sessionMode.disconnect(this._sessionId);
+            this._sessionId = null;
+        }
+        this._stopWatch();
+        this._notifySource?.destroy();
+        this._notifySource = null;
         this._cancellable?.cancel();
         this._cancellable = null;
         this._button?.destroy();
         this._button = null;
         this._motionItem = this._batteryItem = this._liveItem = null;
-        this._snapshotItem = this._snapshotImage = this._todayItem = null;
+        this._snapshotItem = this._snapshotImage = this._todayItem = this._alertsItem = null;
+    }
+
+    _updateLocked() {
+        const locked = Main.sessionMode.isLocked;
+        if (locked)
+            this._button.menu.close();
+        this._button.visible = !locked;
+    }
+
+    // `doorcam watch` prints one JSON line per motion event pushed by the camera
+    _startWatch() {
+        this._watchRetryId = null;
+        this._watchCancellable = new Gio.Cancellable();
+        const cancellable = this._watchCancellable;
+        const started = GLib.get_monotonic_time();
+        let lastError = '';
+        try {
+            this._watchProc = Gio.Subprocess.new([HELPER, 'watch'],
+                Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE);
+        } catch (e) {
+            this._watchEnded(-1, e.message, 0);
+            return;
+        }
+        const proc = this._watchProc;
+        this._readLines(proc.get_stdout_pipe(), cancellable, line => {
+            try {
+                this._onMotion(JSON.parse(line));
+            } catch (e) {
+                console.warn(`doorcam watch: ${e.message}`);
+            }
+        });
+        this._readLines(proc.get_stderr_pipe(), cancellable, line => {
+            lastError = line;
+        });
+        proc.wait_async(cancellable, (p, res) => {
+            try {
+                p.wait_finish(res);
+            } catch {
+                return; // cancelled by disable()
+            }
+            const status = p.get_if_exited() ? p.get_exit_status() : -1;
+            this._watchEnded(status, lastError, (GLib.get_monotonic_time() - started) / 1e6);
+        });
+    }
+
+    _readLines(pipe, cancellable, onLine) {
+        const stream = new Gio.DataInputStream({base_stream: pipe, close_base_stream: true});
+        const next = () => stream.read_line_async(GLib.PRIORITY_DEFAULT, cancellable, (s, res) => {
+            let line;
+            try {
+                [line] = s.read_line_finish_utf8(res);
+            } catch {
+                return;
+            }
+            if (line === null)
+                return; // EOF
+            if (line.trim())
+                onLine(line.trim());
+            next();
+        });
+        next();
+    }
+
+    _watchEnded(status, error, ranSeconds) {
+        this._watchProc = null;
+        if (ranSeconds > 600)
+            this._watchFailures = 0;
+        let delay = WATCH_RETRY_SECONDS[Math.min(this._watchFailures++, WATCH_RETRY_SECONDS.length - 1)];
+        if (status === WATCH_LOGIN_NEEDED) {
+            // picks the new token up by itself once the user has run `doorcam login`
+            this._alertsItem.label.text = 'Motion alerts off: run `doorcam login`';
+            this._alertsItem.show();
+            delay = WATCH_RETRY_SECONDS.at(-1);
+        } else if (this._watchFailures > 1 && error) {
+            this._alertsItem.label.text = `Motion alerts: ${error}`.slice(0, 80);
+            this._alertsItem.show();
+        }
+        this._watchRetryId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, delay, () => {
+            this._startWatch();
+            return GLib.SOURCE_REMOVE;
+        });
+    }
+
+    _stopWatch() {
+        if (this._watchRetryId) {
+            GLib.source_remove(this._watchRetryId);
+            this._watchRetryId = null;
+        }
+        this._watchCancellable?.cancel();
+        this._watchCancellable = null;
+        this._watchProc?.force_exit();
+        this._watchProc = null;
+    }
+
+    _onMotion(event) {
+        this._watchFailures = 0;
+        this._alertsItem.hide();
+        if (!this._notifySource) {
+            this._notifySource = new MessageTray.Source({
+                title: 'Door camera',
+                iconName: 'camera-web-symbolic',
+            });
+            this._notifySource.connect('destroy', () => {
+                this._notifySource = null;
+            });
+            Main.messageTray.add(this._notifySource);
+        }
+        const when = GLib.DateTime.new_from_unix_local(event.time).format('%H:%M:%S');
+        const notification = new MessageTray.Notification({
+            source: this._notifySource,
+            title: event.kind === 'person' ? 'Person at the door' : 'Motion at the door',
+            body: event.snapshot ? `${when} – click to open the snapshot` : when,
+            gicon: event.snapshot ? Gio.FileIcon.new(Gio.File.new_for_path(event.snapshot)) : null,
+        });
+        if (event.snapshot)
+            notification.connect('activated', () => this._openFile(event.snapshot));
+        this._notifySource.addNotification(notification);
+        this._refresh(true);
     }
 
     _refresh(force) {

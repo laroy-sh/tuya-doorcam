@@ -7,10 +7,15 @@
   doorcam live         allocate an RTSP stream and open it in ffplay (wakes the camera)
   doorcam snapshots    download + decrypt recent motion snapshots (needs the
                        movement-configs API enabled for your Tuya project)
+  doorcam login CODE   log in to the Smart Life app's push service (QR code; CODE is the
+                       app's User Code: Me -> Settings -> Account and Security)
+  doorcam watch        wait for motion pushes, print one JSON line per event:
+                       id, time, kind, snapshot (path or null)
 
 Configuration: $XDG_CONFIG_HOME/tuya-doorcam/config.json (see config.example.json).
 """
 import base64
+import fcntl
 import json
 import os
 import shutil
@@ -24,6 +29,11 @@ import tinytuya
 CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "tuya-doorcam"
 CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "tuya-doorcam"
 LOOKBACK_DAYS = 7
+SHARING_TOKEN = CONFIG_DIR / "sharing_token.json"
+# Smart Life app login as used by Home Assistant's Tuya integration (tuya-device-sharing-sdk)
+SHARING_CLIENT_ID = "HA_3y9q4ak7g4ephrvke"
+SHARING_SCHEMA = "haauthorize"
+MQ_DOWN_LIMIT = 600  # watch exits after this many seconds without a push connection
 
 
 def load_config():
@@ -186,14 +196,120 @@ def snapshots(cam, out_dir):
     print(f"saved {saved}, skipped {skipped} -> {out_dir}")
 
 
+def save_sharing_token(info):
+    SHARING_TOKEN.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(SHARING_TOKEN, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(info, f, indent=1)
+
+
+def login(user_code):
+    import qrcode
+    from tuya_sharing import LoginControl
+
+    control = LoginControl()
+    r = control.qr_code(SHARING_CLIENT_ID, SHARING_SCHEMA, user_code)
+    if not r.get("success"):
+        sys.exit(f"login: {r.get('msg', r)}")
+    qr = qrcode.QRCode(border=2)
+    qr.add_data(f"tuyaSmart--qrLogin?token={r['result']['qrcode']}")
+    qr.print_ascii(invert=True)
+    print("Scan with the Smart Life app (Me -> scan icon at the top right)...", flush=True)
+    for _ in range(60):
+        time.sleep(3)
+        ok, info = control.login_result(r["result"]["qrcode"], SHARING_CLIENT_ID, user_code)
+        if ok:
+            save_sharing_token({"user_code": user_code, **info})
+            print(f"logged in, token saved to {SHARING_TOKEN}")
+            return
+    sys.exit("login: timed out waiting for the scan")
+
+
+def watch(cfg):
+    """Print a JSON line for every motion event the camera pushes. Exit codes: 2 = login needed."""
+    from tuya_sharing import Manager, SharingTokenListener
+
+    runtime = Path(os.environ.get("XDG_RUNTIME_DIR", CACHE_DIR))
+    lock = open(runtime / "tuya-doorcam-watch.lock", "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:  # two listeners would race to refresh the same token
+        sys.exit("watch: already running")
+
+    try:
+        token = json.loads(SHARING_TOKEN.read_text())
+    except FileNotFoundError:
+        print("watch: not logged in, run `doorcam login USER_CODE`", file=sys.stderr)
+        sys.exit(2)
+
+    class TokenSaver(SharingTokenListener):
+        def update_token(self, token_info):
+            token.update(token_info)
+            save_sharing_token(token)
+
+    mgr = Manager(SHARING_CLIENT_ID, token["user_code"], token["terminal_id"], token["endpoint"],
+                  token, TokenSaver())
+    try:
+        mgr.update_device_cache()
+    except Exception as e:
+        print(f"watch: login expired ({e}), run `doorcam login USER_CODE`", file=sys.stderr)
+        sys.exit(2)
+    camera = mgr.device_map.get(cfg["device_id"])
+    if camera is None:
+        sys.exit("watch: camera not found in the Smart Life account")
+    camera.set_up = True  # the SDK only subscribes to devices flagged as set up
+
+    seen = set()
+
+    def on_message(msg):
+        data = msg.get("data", {})
+        if data.get("devId") != cfg["device_id"]:
+            return
+        for dp in data.get("status", []):
+            if dp.get("code") != "alarm_message" or dp.get("t") in seen:
+                continue
+            seen.add(dp.get("t"))
+            event_id = dp.get("t") or int(time.time() * 1000)
+            alarm = decode_alarm(dp.get("value", ""))
+            snapshot = None
+            if has_picture(alarm):
+                for attempt in range(3):  # the upload may lag the push by a moment
+                    try:
+                        snapshot = str(cached_image(Camera(cfg), event_id, alarm))
+                        break
+                    except Exception as e:
+                        print(f"watch: snapshot attempt {attempt + 1}: {e}", file=sys.stderr, flush=True)
+                        time.sleep(3)
+            print(json.dumps({"id": event_id, "time": event_id // 1000,
+                              "kind": event_kind(alarm), "snapshot": snapshot}), flush=True)
+
+    mgr.refresh_mq()
+    mgr.mq.add_message_listener(on_message)
+    down_since = None
+    while True:
+        time.sleep(60)
+        client = getattr(mgr.mq, "client", None)
+        if client is not None and client.is_connected():
+            down_since = None
+        elif down_since is None:
+            down_since = time.monotonic()
+        elif time.monotonic() - down_since > MQ_DOWN_LIMIT:
+            sys.exit("watch: push connection lost")  # the extension restarts us
+
+
 def main():
     cmd = sys.argv[1] if len(sys.argv) > 1 else "status"
-    if cmd not in ("status", "live", "snapshots", "snapshot") or \
-            (cmd == "snapshot" and (len(sys.argv) < 3 or not sys.argv[2].isdigit())):
+    if cmd not in ("status", "live", "snapshots", "snapshot", "login", "watch") or \
+            (cmd == "snapshot" and (len(sys.argv) < 3 or not sys.argv[2].isdigit())) or \
+            (cmd == "login" and len(sys.argv) < 3):
         sys.exit(__doc__)
+    if cmd == "login":
+        return login(sys.argv[2])
     if cmd == "snapshot" and cached_path(int(sys.argv[2])).exists():
         print(cached_path(int(sys.argv[2])))  # no API calls for pictures we already have
         return
+    if cmd == "watch":
+        return watch(load_config())
     cam = Camera(load_config())
     if cmd == "status":
         try:

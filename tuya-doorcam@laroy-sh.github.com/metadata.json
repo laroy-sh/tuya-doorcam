@@ -1,8 +1,9 @@
 {
   "uuid": "tuya-doorcam@laroy-sh.github.com",
   "name": "Tuya Door Camera",
-  "description": "Last motion, battery level and live view for a Tuya battery door camera (peephole / cateye). Needs the doorcam helper and a Tuya IoT developer project.",
+  "description": "Motion notifications with snapshots, last motion, battery level and live view for a Tuya battery door camera (peephole / cateye). Needs the doorcam helper and a Tuya IoT developer project.",
   "url": "https://github.com/laroy-sh/tuya-doorcam",
   "shell-version": ["46"],
+  "session-modes": ["user", "unlock-dialog"],
   "version": 1
 }
