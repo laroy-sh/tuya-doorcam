@@ -12,6 +12,8 @@ const HELPER = GLib.find_program_in_path('doorcam') ??
     GLib.build_filenamev([GLib.get_home_dir(), '.local', 'bin', 'doorcam']);
 const POLL_SECONDS = 600;       // background refresh; each refresh costs 2 Tuya API calls
 const MIN_REFRESH_SECONDS = 60; // opening the menu refreshes at most this often
+const THUMB_WIDTH = 320;        // snapshots are 640x360
+const THUMB_HEIGHT = 180;
 
 function formatWhen(epoch) {
     if (!epoch)
@@ -45,6 +47,14 @@ export default class DoorCamExtension extends Extension {
         this._batteryItem = new PopupMenu.PopupMenuItem('Battery: …', {reactive: false});
         menu.addMenuItem(this._motionItem);
         menu.addMenuItem(this._batteryItem);
+
+        // latest motion snapshot; click opens it full size in the default image viewer
+        this._snapshotItem = new PopupMenu.PopupBaseMenuItem();
+        this._snapshotImage = new St.Widget({width: THUMB_WIDTH, height: THUMB_HEIGHT});
+        this._snapshotItem.add_child(this._snapshotImage);
+        this._snapshotItem.connect('activate', () => this._openSnapshot());
+        this._snapshotItem.hide();
+        menu.addMenuItem(this._snapshotItem);
         menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
 
         this._liveItem = new PopupMenu.PopupImageMenuItem('Live view', 'media-playback-start-symbolic');
@@ -81,6 +91,7 @@ export default class DoorCamExtension extends Extension {
         this._button?.destroy();
         this._button = null;
         this._motionItem = this._batteryItem = this._liveItem = null;
+        this._snapshotItem = this._snapshotImage = null;
     }
 
     _refresh(force) {
@@ -116,11 +127,32 @@ export default class DoorCamExtension extends Extension {
         if (s.error) {
             this._motionItem.label.text = `Error: ${s.error}`.slice(0, 80);
             this._batteryItem.label.text = 'Battery: ?';
+            this._snapshotItem.hide();
             return;
         }
         this._motionItem.label.text = `Last motion: ${formatWhen(s.last_motion)}`;
         const online = s.online ? '' : ' (offline)';
         this._batteryItem.label.text = `Battery: ${s.battery ?? '?'}%${online}`;
+
+        // the file name changes with every new event, so St's texture cache never shows a stale image
+        if (s.snapshot) {
+            this._snapshotImage.style = `background-image: url("file://${s.snapshot}");` +
+                ' background-size: contain; border-radius: 6px;';
+            this._snapshotItem.show();
+        } else {
+            this._snapshotItem.hide();
+        }
+    }
+
+    _openSnapshot() {
+        const path = this._status?.snapshot;
+        if (!path)
+            return;
+        try {
+            Gio.AppInfo.launch_default_for_uri(Gio.File.new_for_path(path).get_uri(), null);
+        } catch (e) {
+            Main.notify('Door camera', `Cannot open snapshot: ${e.message}`);
+        }
     }
 
     _startLive() {

@@ -1,5 +1,6 @@
 # personal data: credentials, tokens, images, notes, experiments
 local/
+HANDOFF.md
 config.json
 tinytuya.json
 *token*.json

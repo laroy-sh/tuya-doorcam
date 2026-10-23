@@ -1,6 +1,7 @@
 """Tuya battery door camera helper (used by the Tuya Door Camera GNOME extension).
 
-  doorcam status       JSON: name, online, battery, last_motion (epoch seconds or null)
+  doorcam status       JSON: name, online, battery, last_motion (epoch seconds or null),
+                       snapshot (path of the newest motion snapshot, cached) and snapshot_time
   doorcam live         allocate an RTSP stream and open it in ffplay (wakes the camera)
   doorcam snapshots    download + decrypt recent motion snapshots (needs the
                        movement-configs API enabled for your Tuya project)
@@ -19,6 +20,7 @@ from pathlib import Path
 import tinytuya
 
 CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "tuya-doorcam"
+CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "tuya-doorcam"
 LOOKBACK_DAYS = 7
 
 
@@ -64,13 +66,38 @@ def decode_alarm(value):
 def status(cam):
     dev = cam.request("")
     dps = {s["code"]: s["value"] for s in dev.get("status", [])}
-    events = cam.motion_events(size=1)
-    return {
+    events = cam.motion_events(size=5)
+    result = {
         "name": dev.get("name"),
         "online": dev.get("online"),
         "battery": dps.get("wireless_electricity"),
         "last_motion": events[0]["event_time"] // 1000 if events else None,
     }
+    try:
+        result.update(latest_snapshot(cam, events))
+    except Exception as e:  # a missing picture shouldn't hide battery / motion
+        result["snapshot_error"] = str(e)
+    return result
+
+
+def latest_snapshot(cam, events):
+    """Newest event with a picture, kept as CACHE_DIR/<event ms>.jpg (one API call per new event)."""
+    for event in events:
+        msg = decode_alarm(event["value"])
+        if msg and "bucket" in msg:
+            break
+    else:
+        return {}
+    dest = CACHE_DIR / f"{event['event_time']}.jpg"
+    if not dest.exists():
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = dest.with_suffix(".part")
+        tmp.write_bytes(fetch_image(cam, msg))
+        tmp.rename(dest)
+        for old in CACHE_DIR.glob("*.jpg"):
+            if old != dest:
+                old.unlink()
+    return {"snapshot": str(dest), "snapshot_time": event["event_time"] // 1000}
 
 
 def live(cam):
@@ -92,6 +119,15 @@ def decrypt_image(blob, key):
     return plain[:plain.rfind(b"\xff\xd9") + 2]
 
 
+def fetch_image(cam, msg):
+    path, key = msg["files"][0]
+    url = cam.request("/movement-configs", query={"bucket": msg["bucket"], "file_path": path})
+    jpg = decrypt_image(urllib.request.urlopen(url, timeout=30).read(), key)
+    if not jpg.startswith(b"\xff\xd8"):
+        raise RuntimeError("snapshot decryption failed")
+    return jpg
+
+
 def snapshots(cam, out_dir):
     out_dir.mkdir(parents=True, exist_ok=True)
     saved = skipped = 0
@@ -99,17 +135,12 @@ def snapshots(cam, out_dir):
         msg = decode_alarm(event["value"])
         if not msg or "bucket" not in msg:
             continue
-        path, key = msg["files"][0]
         stamp = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime(event["event_time"] / 1000))
         dest = out_dir / f"{stamp}_{msg.get('cmd', 'event')}.jpg"
         if dest.exists():
             skipped += 1
             continue
-        url = cam.request("/movement-configs", query={"bucket": msg["bucket"], "file_path": path})
-        jpg = decrypt_image(urllib.request.urlopen(url, timeout=30).read(), key)
-        if not jpg.startswith(b"\xff\xd8"):
-            raise RuntimeError(f"decryption failed for {stamp}")
-        dest.write_bytes(jpg)
+        dest.write_bytes(fetch_image(cam, msg))
         saved += 1
     print(f"saved {saved}, skipped {skipped} -> {out_dir}")
 
