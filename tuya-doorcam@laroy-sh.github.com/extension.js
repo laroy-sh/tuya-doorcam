@@ -231,6 +231,9 @@ export default class DoorCamExtension extends Extension {
             title: event.kind === 'person' ? 'Person at the door' : 'Motion at the door',
             body: event.snapshot ? `${when} – click to open the snapshot` : when,
             gicon: event.snapshot ? Gio.FileIcon.new(Gio.File.new_for_path(event.snapshot)) : null,
+            // GNOME only queues normal banners while a window is fullscreen or Do Not Disturb is
+            // on; "feedback" ones still pop up (and auto-hide as usual)
+            forFeedback: true,
         });
         if (event.snapshot)
             notification.connect('activated', () => this._openFile(event.snapshot));
