@@ -55,6 +55,10 @@ export default class DoorCamExtension extends Extension {
         this._snapshotItem.connect('activate', () => this._openSnapshot());
         this._snapshotItem.hide();
         menu.addMenuItem(this._snapshotItem);
+
+        // today's events; clicking one opens its snapshot (downloaded on first use)
+        this._todayItem = new PopupMenu.PopupSubMenuMenuItem('Today: …');
+        menu.addMenuItem(this._todayItem);
         menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
 
         this._liveItem = new PopupMenu.PopupImageMenuItem('Live view', 'media-playback-start-symbolic');
@@ -91,7 +95,7 @@ export default class DoorCamExtension extends Extension {
         this._button?.destroy();
         this._button = null;
         this._motionItem = this._batteryItem = this._liveItem = null;
-        this._snapshotItem = this._snapshotImage = null;
+        this._snapshotItem = this._snapshotImage = this._todayItem = null;
     }
 
     _refresh(force) {
@@ -128,6 +132,7 @@ export default class DoorCamExtension extends Extension {
             this._motionItem.label.text = `Error: ${s.error}`.slice(0, 80);
             this._batteryItem.label.text = 'Battery: ?';
             this._snapshotItem.hide();
+            this._todayItem.hide();
             return;
         }
         this._motionItem.label.text = `Last motion: ${formatWhen(s.last_motion)}`;
@@ -142,12 +147,52 @@ export default class DoorCamExtension extends Extension {
         } else {
             this._snapshotItem.hide();
         }
+        this._renderToday(s.today ?? []);
+    }
+
+    _renderToday(events) {
+        const n = events.length;
+        this._todayItem.label.text = `Today: ${n === 0 ? 'no' : n} event${n === 1 ? '' : 's'}`;
+        this._todayItem.show();
+        const sub = this._todayItem.menu;
+        sub.removeAll();
+        for (const e of events) {
+            const when = GLib.DateTime.new_from_unix_local(e.time).format('%H:%M');
+            const item = new PopupMenu.PopupImageMenuItem(`${when}  ${e.kind}`,
+                e.has_snapshot ? 'image-x-generic-symbolic' : 'action-unavailable-symbolic');
+            if (e.has_snapshot)
+                item.connect('activate', () => this._openEventSnapshot(e.id));
+            else
+                item.setSensitive(false);
+            sub.addMenuItem(item);
+        }
+    }
+
+    _openEventSnapshot(id) {
+        try {
+            const proc = Gio.Subprocess.new([HELPER, 'snapshot', String(id)],
+                Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE);
+            proc.communicate_utf8_async(null, null, (p, res) => {
+                try {
+                    const [, stdout, stderr] = p.communicate_utf8_finish(res);
+                    if (!p.get_successful())
+                        throw new Error(stderr?.trim().split('\n').pop() || 'no snapshot');
+                    this._openFile(stdout.trim());
+                } catch (e) {
+                    Main.notify('Door camera', `Cannot open snapshot: ${e.message}`);
+                }
+            });
+        } catch (e) {
+            Main.notify('Door camera', `Cannot open snapshot: ${e.message}`);
+        }
     }
 
     _openSnapshot() {
-        const path = this._status?.snapshot;
-        if (!path)
-            return;
+        if (this._status?.snapshot)
+            this._openFile(this._status.snapshot);
+    }
+
+    _openFile(path) {
         try {
             Gio.AppInfo.launch_default_for_uri(Gio.File.new_for_path(path).get_uri(), null);
         } catch (e) {

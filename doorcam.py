@@ -1,7 +1,9 @@
 """Tuya battery door camera helper (used by the Tuya Door Camera GNOME extension).
 
   doorcam status       JSON: name, online, battery, last_motion (epoch seconds or null),
-                       snapshot (path of the newest motion snapshot, cached) and snapshot_time
+                       snapshot (path of the newest motion snapshot, cached), snapshot_time
+                       and today (list of today's events: id, time, kind, has_snapshot)
+  doorcam snapshot ID  print the path of event ID's snapshot (ID from "today"), downloading it if needed
   doorcam live         allocate an RTSP stream and open it in ffplay (wakes the camera)
   doorcam snapshots    download + decrypt recent motion snapshots (needs the
                        movement-configs API enabled for your Tuya project)
@@ -48,11 +50,13 @@ class Camera:
             raise RuntimeError(f"{r.get('code')}: {r.get('msg')}")
         return r["result"]
 
-    def motion_events(self, size=20):
-        now = int(time.time() * 1000)
+    def motion_events(self, size=20, start=None, end=None):
+        """Newest first. start/end in epoch ms, default: the last LOOKBACK_DAYS."""
+        end = end or int(time.time() * 1000)
+        start = start or end - LOOKBACK_DAYS * 86400000
         return self.request("/logs", query={
             "type": "7", "codes": "alarm_message", "size": size,
-            "start_time": now - LOOKBACK_DAYS * 86400000, "end_time": now})["logs"]
+            "start_time": start, "end_time": end})["logs"]
 
 
 def decode_alarm(value):
@@ -63,15 +67,34 @@ def decode_alarm(value):
         return None
 
 
+def has_picture(msg):
+    return bool(msg and "bucket" in msg)
+
+
+def event_kind(msg):
+    cmd = (msg or {}).get("cmd", "")
+    return {"ipc_human": "person", "ipc_motion": "motion", "ipc_doorbell": "doorbell"}.get(
+        cmd, cmd.removeprefix("ipc_") or "motion")
+
+
 def status(cam):
     dev = cam.request("")
     dps = {s["code"]: s["value"] for s in dev.get("status", [])}
-    events = cam.motion_events(size=5)
+    events = cam.motion_events(size=100)
+    midnight = time.mktime(time.localtime()[:3] + (0, 0, 0, 0, 0, -1)) * 1000
+    today = []
+    for event in events:
+        if event["event_time"] < midnight:
+            break
+        msg = decode_alarm(event["value"])
+        today.append({"id": event["event_time"], "time": event["event_time"] // 1000,
+                      "kind": event_kind(msg), "has_snapshot": has_picture(msg)})
     result = {
         "name": dev.get("name"),
         "online": dev.get("online"),
         "battery": dps.get("wireless_electricity"),
         "last_motion": events[0]["event_time"] // 1000 if events else None,
+        "today": today,
     }
     try:
         result.update(latest_snapshot(cam, events))
@@ -81,23 +104,41 @@ def status(cam):
 
 
 def latest_snapshot(cam, events):
-    """Newest event with a picture, kept as CACHE_DIR/<event ms>.jpg (one API call per new event)."""
+    """Newest event with a picture (one API call per new event)."""
     for event in events:
         msg = decode_alarm(event["value"])
-        if msg and "bucket" in msg:
-            break
-    else:
-        return {}
-    dest = CACHE_DIR / f"{event['event_time']}.jpg"
+        if has_picture(msg):
+            path = cached_image(cam, event["event_time"], msg)
+            return {"snapshot": str(path), "snapshot_time": event["event_time"] // 1000}
+    return {}
+
+
+def cached_path(event_id):
+    return CACHE_DIR / f"{event_id}.jpg"
+
+
+def cached_image(cam, event_id, msg):
+    """Snapshot kept as CACHE_DIR/<event ms>.jpg; files older than LOOKBACK_DAYS are dropped."""
+    dest = cached_path(event_id)
     if not dest.exists():
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
         tmp = dest.with_suffix(".part")
         tmp.write_bytes(fetch_image(cam, msg))
         tmp.rename(dest)
+        cutoff = (time.time() - LOOKBACK_DAYS * 86400) * 1000
         for old in CACHE_DIR.glob("*.jpg"):
-            if old != dest:
+            if old.stem.isdigit() and int(old.stem) < cutoff:
                 old.unlink()
-    return {"snapshot": str(dest), "snapshot_time": event["event_time"] // 1000}
+    return dest
+
+
+def event_snapshot(cam, event_id):
+    """Path of one event's snapshot; the logs API needs a window around the exact timestamp."""
+    for event in cam.motion_events(size=5, start=event_id - 1000, end=event_id + 1000):
+        msg = decode_alarm(event["value"])
+        if event["event_time"] == event_id and has_picture(msg):
+            return cached_image(cam, event_id, msg)
+    raise RuntimeError("no snapshot for this event")
 
 
 def live(cam):
@@ -147,8 +188,12 @@ def snapshots(cam, out_dir):
 
 def main():
     cmd = sys.argv[1] if len(sys.argv) > 1 else "status"
-    if cmd not in ("status", "live", "snapshots"):
+    if cmd not in ("status", "live", "snapshots", "snapshot") or \
+            (cmd == "snapshot" and (len(sys.argv) < 3 or not sys.argv[2].isdigit())):
         sys.exit(__doc__)
+    if cmd == "snapshot" and cached_path(int(sys.argv[2])).exists():
+        print(cached_path(int(sys.argv[2])))  # no API calls for pictures we already have
+        return
     cam = Camera(load_config())
     if cmd == "status":
         try:
@@ -157,6 +202,11 @@ def main():
             print(json.dumps({"error": str(e)}))
     elif cmd == "live":
         live(cam)
+    elif cmd == "snapshot":
+        try:
+            print(event_snapshot(cam, int(sys.argv[2])))
+        except Exception as e:
+            sys.exit(f"snapshot: {e}")
     else:
         out = Path(sys.argv[2]) if len(sys.argv) > 2 else Path.home() / "Pictures" / "DoorCam"
         try:

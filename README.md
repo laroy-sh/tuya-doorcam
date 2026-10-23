@@ -5,6 +5,7 @@ A GNOME Shell panel indicator for Tuya / Smart Life **battery door cameras** (pe
 - **Last motion** time ("01:05 (35 min ago)")
 - **Battery** level and online state
 - **Latest motion snapshot** as a thumbnail (click to open it full size)
+- **Today's events** (time and type) – click one to open its snapshot
 - **Live view** button – wakes the camera and opens the stream in `ffplay`
 
 It talks to the Tuya cloud through your own (free) Tuya IoT developer project via a small Python helper, `doorcam`.
@@ -62,7 +63,8 @@ gnome-extensions enable tuya-doorcam@laroy-sh.github.com
   Status checks don't wake it.
 - **API usage:** the extension refreshes every 10 minutes and when the menu is opened
   (at most once a minute), 2 calls each – roughly 3,000 calls a month – plus one call per new
-  motion event to fetch its snapshot (cached in `~/.cache/tuya-doorcam`).
+  motion event to fetch its snapshot, and two per event you open from *Today* (pictures are cached in
+  `~/.cache/tuya-doorcam` for 7 days, so reopening one is free).
 - **mpv:** the snap build of mpv fails with `401 Unauthorized` on Tuya's `rtsps://` URLs, so `ffplay` is used.
 - **Motion snapshots:** the menu thumbnail and `doorcam snapshots [dir]` (downloads and decrypts the
   camera's cloud snapshots from the last ~7 days) need `GET /v1.0/devices/{id}/movement-configs`, which Tuya
