@@ -288,6 +288,9 @@ def watch(cfg):
     down_since = None
     while True:
         time.sleep(60)
+        # the SDK renews the 2 h token only on API calls in its last minute; the push connection
+        # makes none for hours, and a refresh token left unused that long gets rejected
+        mgr.customer_api.refresh_access_token_if_need()
         client = getattr(mgr.mq, "client", None)
         if client is not None and client.is_connected():
             down_since = None
